@@ -1,3 +1,4 @@
+use once_cell::sync::Lazy;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -5,7 +6,8 @@ use std::time::{Duration, Instant};
 use crossbeam::channel::RecvTimeoutError;
 use rusqlite::{ErrorCode, OpenFlags, StatementStatus};
 use sqld_libsql_bindings::wal_hook::WalMethodsHook;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
+use tokio::time::timeout;
 use tracing::warn;
 
 use crate::auth::{Authenticated, Authorized};
@@ -241,6 +243,36 @@ struct Connection<'a> {
     builder_config: QueryBuilderConfig,
 }
 
+struct Foo {
+    foo: usize,
+    tx: watch::Sender<usize>,
+    rx: watch::Receiver<usize>,
+}
+
+impl Foo {
+    fn new() -> Self {
+        let (tx, rx) = watch::channel(1);
+        Self { foo: 0, tx, rx }
+    }
+    async fn wait(&self) {
+        let mut rx = self.rx.clone();
+        while *rx.borrow() == 0 {
+            rx.changed().await.unwrap();
+        }
+    }
+
+    fn start(&self) {
+        // XXX: Racy
+        self.tx.send_replace(0);
+    }
+
+    fn end(&self) {
+        self.tx.send_replace(1);
+    }
+}
+
+static TRANSACTION: Lazy<Arc<Foo>> = Lazy::new(|| Arc::new(Foo::new()));
+
 impl<'a> Connection<'a> {
     fn new<W: WalHook>(
         path: &Path,
@@ -282,6 +314,9 @@ impl<'a> Connection<'a> {
 
         for step in pgm.steps() {
             let res = self.execute_step(step, &results, &mut builder)?;
+            if step.query.stmt.kind == StmtKind::TxnEnd {
+                TRANSACTION.end()
+            }
             results.push(res);
         }
 
@@ -342,7 +377,9 @@ impl<'a> Connection<'a> {
 
         let config = self.config_store.get();
         let blocked = match query.stmt.kind {
-            StmtKind::Read | StmtKind::TxnBegin | StmtKind::Other => config.block_reads,
+            StmtKind::Read | StmtKind::TxnBegin | StmtKind::TxnBeginImmediate | StmtKind::Other => {
+                config.block_reads
+            }
             StmtKind::Write => config.block_reads || config.block_writes,
             StmtKind::TxnEnd => false,
         };
@@ -505,6 +542,20 @@ impl Database for LibSqlDb {
     ) -> Result<(B, State)> {
         check_program_auth(auth, &pgm)?;
         let (resp, receiver) = oneshot::channel();
+        if pgm.has_exclusive_txn {
+            let tres = timeout(TXN_TIMEOUT, async move {
+                let mut rx = TRANSACTION.rx.clone();
+                while *rx.borrow() == 0 {
+                    let _ = rx.changed().await;
+                }
+            })
+            .await;
+            if let Err(_) = tres {
+                return Err(Error::LibSqlTxTimeout);
+            }
+            // XXX: Racy
+            TRANSACTION.start()
+        }
         let cb = Box::new(move |maybe_conn: Result<&mut Connection>| {
             let res = maybe_conn.and_then(|c| {
                 let b = c.run(pgm, builder)?;

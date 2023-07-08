@@ -1,6 +1,6 @@
 use anyhow::Result;
 use fallible_iterator::FallibleIterator;
-use sqlite3_parser::ast::{Cmd, PragmaBody, QualifiedName, Stmt};
+use sqlite3_parser::ast::{Cmd, PragmaBody, QualifiedName, Stmt, TransactionType};
 use sqlite3_parser::lexer::sql::{Parser, ParserError};
 
 /// A group of statements to be executed together.
@@ -23,6 +23,7 @@ impl Default for Statement {
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum StmtKind {
     /// The begining of a transaction
+    TxnBeginImmediate,
     TxnBegin,
     /// The end of a transaction
     TxnEnd,
@@ -50,7 +51,12 @@ impl StmtKind {
             Cmd::Explain(Stmt::Pragma(name, body)) => Self::pragma_kind(name, body.as_ref()),
             Cmd::Explain(_) => Some(Self::Other),
             Cmd::ExplainQueryPlan(_) => Some(Self::Other),
-            Cmd::Stmt(Stmt::Begin { .. }) => Some(Self::TxnBegin),
+            Cmd::Stmt(Stmt::Begin(ty, _)) => match ty {
+                Some(TransactionType::Exclusive | TransactionType::Immediate) => {
+                    Some(Self::TxnBeginImmediate)
+                }
+                _ => Some(Self::TxnBegin),
+            },
             Cmd::Stmt(Stmt::Commit { .. } | Stmt::Rollback { .. }) => Some(Self::TxnEnd),
             Cmd::Stmt(
                 Stmt::CreateVirtualTable { tbl_name, .. }
@@ -177,11 +183,14 @@ pub enum State {
 impl State {
     pub fn step(&mut self, kind: StmtKind) {
         *self = match (*self, kind) {
-            (State::Txn, StmtKind::TxnBegin) | (State::Init, StmtKind::TxnEnd) => State::Invalid,
+            (State::Txn, StmtKind::TxnBegin)
+            | (State::Txn, StmtKind::TxnBeginImmediate)
+            | (State::Init, StmtKind::TxnEnd) => State::Invalid,
             (State::Txn, StmtKind::TxnEnd) => State::Init,
             (state, StmtKind::Other | StmtKind::Write | StmtKind::Read) => state,
             (State::Invalid, _) => State::Invalid,
             (State::Init, StmtKind::TxnBegin) => State::Txn,
+            (State::Init, StmtKind::TxnBeginImmediate) => State::Txn,
         };
     }
 

@@ -6,7 +6,7 @@ use crate::auth::Authenticated;
 use crate::database::{Cond, Database, Program, Step};
 use crate::hrana::stmt::StmtError;
 use crate::query::{Params, Query};
-use crate::query_analysis::Statement;
+use crate::query_analysis::{Statement, StmtKind};
 use crate::query_result_builder::{QueryResultBuilder, StepResult, StepResultsBuilder};
 
 use super::result_builder::HranaBatchProtoBuilder;
@@ -55,8 +55,12 @@ pub fn proto_batch_to_program(
     version: Version,
 ) -> Result<Program> {
     let mut steps = Vec::with_capacity(batch.steps.len());
+    let mut has_exclusive_txn = false;
     for (step_i, step) in batch.steps.iter().enumerate() {
         let query = proto_stmt_to_query(&step.stmt, sqls, version)?;
+        if query.stmt.kind == StmtKind::TxnBeginImmediate {
+            has_exclusive_txn = true;
+        }
         let cond = step
             .condition
             .as_ref()
@@ -66,8 +70,10 @@ pub fn proto_batch_to_program(
 
         steps.push(step);
     }
-
-    Ok(Program::new(steps))
+    Ok(Program {
+        steps: Arc::new(steps),
+        has_exclusive_txn,
+    })
 }
 
 pub async fn execute_batch(
@@ -86,6 +92,7 @@ pub fn proto_sequence_to_program(sql: &str) -> Result<Program> {
         .collect::<Result<Vec<_>>>()
         .map_err(|err| anyhow!(StmtError::SqlParse { source: err }))?;
 
+    let mut has_exclusive_txn = false;
     let steps = stmts
         .into_iter()
         .enumerate()
@@ -94,6 +101,9 @@ pub fn proto_sequence_to_program(sql: &str) -> Result<Program> {
                 0 => None,
                 _ => Some(Cond::Ok { step: step_i - 1 }),
             };
+            if stmt.kind == StmtKind::TxnBeginImmediate {
+                has_exclusive_txn = true;
+            }
             let query = Query {
                 stmt,
                 params: Params::empty(),
@@ -104,6 +114,7 @@ pub fn proto_sequence_to_program(sql: &str) -> Result<Program> {
         .collect();
     Ok(Program {
         steps: Arc::new(steps),
+        has_exclusive_txn,
     })
 }
 

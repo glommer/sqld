@@ -18,12 +18,14 @@ const TXN_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct Program {
     pub steps: Arc<Vec<Step>>,
+    pub has_exclusive_txn: bool,
 }
 
 impl Program {
     pub fn new(steps: Vec<Step>) -> Self {
         Self {
             steps: Arc::new(steps),
+            has_exclusive_txn: false,
         }
     }
 
